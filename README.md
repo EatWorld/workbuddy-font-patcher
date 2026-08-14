@@ -65,6 +65,7 @@ node workbuddy-font-patcher.js restore
 | `patch-font.bat` | 一键换字体（Windows） |
 | `restore-font.bat` | 一键还原默认字体 |
 | `workbuddy-font-patcher.js` | 核心脚本（纯 Node，零依赖） |
+| `fonts/` | 附赠的「仓耳今楷」字体（5 个字重，免费商用），双击即可安装 |
 
 ## 免责声明
 
