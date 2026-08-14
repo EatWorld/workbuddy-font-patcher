@@ -128,6 +128,10 @@ function parseFontName(input) {
   return names.map(n => '"' + n.replace(/"/g, '') + '"').join(', ') + ', ';
 }
 
+// 补丁标记：写进 index.html，用于识别"当前 app.asar 是否已被本工具改过"
+// （从而在 WorkBuddy 升级后能正确识别新版本并更新备份，而不是拿旧备份覆盖新版）
+const MARK = 'wb-font-patched';
+
 // ==================== 4. 交互输入 ====================
 function ask(question) {
   return new Promise(resolve => {
@@ -163,7 +167,7 @@ function ask(question) {
   // 字体名
   let fontInput = fontArg;
   if (!fontInput) {
-    fontInput = await ask('请输入要换成的字体家族名（例如：霞鹜文楷 或 LXGW WenKai）：');
+    fontInput = await ask('请输入字体家族名（要精确，可在「Windows 设置 → 个性化 → 字体」里查；例如：仓耳今楷03 / 霞鹜文楷 / LXGW WenKai）：');
   }
   let F;
   try {
@@ -174,9 +178,14 @@ function ask(question) {
   }
   console.log('目标字体:', F.trim());
 
-  // 幂等：从备份重建（保证每次都是干净补丁，无历史残留）
-  const base = fs.existsSync(backup) ? backup : target;
-  const { fd, header, dataStart } = readAsarHeader(base);
+  // 始终从「当前 app.asar」读，避免 WorkBuddy 升级后从旧备份覆盖回旧版
+  const { fd, header, dataStart } = readAsarHeader(target);
+
+  // 仅在首次运行时备份原始文件（backup 不存在时），之后保留这份原始备份用于还原
+  if (!fs.existsSync(backup)) {
+    fs.copyFileSync(target, backup);
+    console.log('✓ 已备份原始文件（用于还原）:', backup);
+  }
 
   // 遍历收集所有文件
   const entries = [];
@@ -194,7 +203,11 @@ function ask(question) {
     let modified = false;
     if (e.path.startsWith('renderer/') && (e.path.endsWith('.css') || e.path.endsWith('.html'))) {
       const s = buf.toString('utf8');
-      const s2 = patcher(s);
+      let s2 = patcher(s);
+      // 在 index.html 里打标记，用于识别"已 patch"状态
+      if (e.path === 'renderer/index.html' && !s2.includes(MARK)) {
+        s2 = s2.replace('</style>', '/* ' + MARK + ' */</style>');
+      }
       if (s2 !== s) { buf = Buffer.from(s2, 'utf8'); modified = true; patched++; }
     }
     packed.push({ path: e.path, buffer: buf, node: e.node, modified });
