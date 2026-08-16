@@ -132,6 +132,39 @@ function parseFontName(input) {
 // （从而在 WorkBuddy 升级后能正确识别新版本并更新备份，而不是拿旧备份覆盖新版）
 const MARK = 'wb-font-patched';
 
+// Claude Warm 配色覆盖（仅 light 主题），追加到 cb-bridge 样式文件末尾
+const THEME_MARK = 'wb-theme-patched';
+const CLAUDE_THEME_CSS = `
+/* ${THEME_MARK} Claude Warm 配色覆盖（仅 light 主题） */
+body[data-vscode-theme-name="IDE Light"] {
+  --wb-palette-brand-1: #f6ead6;
+  --wb-palette-brand-2: #edd9b3;
+  --wb-palette-brand-3: #e4c78f;
+  --wb-palette-brand-4: #dbb56b;
+  --wb-palette-brand-5: #d2a347;
+  --wb-palette-brand-7: #c98a2a;
+  --wb-palette-brand-8: #b7791f;
+  --wb-palette-brand-9: #9f6819;
+  --wb-palette-brand-10: #8a5e16;
+  --wb-palette-gray-1: #faf9f4;
+  --wb-palette-gray-2: #f5f3eb;
+  --wb-palette-gray-3: #f0eee6;
+  --wb-palette-gray-4: #e9e4d6;
+  --wb-palette-gray-5: #ddd7c6;
+  --wb-palette-white-100: #f8f7f2;
+  --wb-palette-black-100: #49432f;
+  --wb-brand-accent: #b7791f;
+  --wb-brand-accent-bg: #f6ead6;
+  --wb-brand-icon-bg: #f6ead6;
+  --wb-brand-primary-subtle: rgba(183, 121, 31, 0.12);
+  --wb-brand-primary-deep: #8a5e16;
+  --wb-home-bg-primary: #f0eee6;
+  --wb-home-bg-secondary: #f8f7f2;
+  --vscode-editor-background: #f8f7f2;
+  --vscode-editor-foreground: #49432f;
+}
+`;
+
 // ==================== 4. 交互输入 ====================
 function ask(question) {
   return new Promise(resolve => {
@@ -164,19 +197,29 @@ function ask(question) {
     process.exit(0);
   }
 
-  // 字体名
+  // 字体名（可跳过）
   let fontInput = fontArg;
-  if (!fontInput) {
-    fontInput = await ask('请输入字体家族名（要精确，可在「Windows 设置 → 个性化 → 字体」里查；例如：仓耳今楷03 / 霞鹜文楷 / LXGW WenKai）：');
+  if (fontInput === undefined || fontInput === '') {
+    fontInput = await ask('[1/2] 字体名（直接回车 = 不改字体；要精确，例如：仓耳今楷03 / 霞鹜文楷）：');
   }
-  let F;
-  try {
-    F = parseFontName(fontInput);
-  } catch (e) {
-    console.error('✗ ' + e.message);
-    process.exit(1);
+  let F = null;
+  if (fontInput && fontInput.trim()) {
+    try {
+      F = parseFontName(fontInput);
+    } catch (e) {
+      console.error('✗ ' + e.message);
+      process.exit(1);
+    }
   }
-  console.log('目标字体:', F.trim());
+
+  // 配色（默认改）
+  let doTheme = true;
+  const themeAns = await ask('[2/2] 改成 Claude 暖色配色？(y/n，默认 y)：');
+  if (themeAns && themeAns.toLowerCase().startsWith('n')) doTheme = false;
+
+  if (!F && !doTheme) { console.log('未选择任何改动，退出。'); process.exit(0); }
+  console.log(F ? ('目标字体: ' + F.trim()) : '字体: 不改');
+  console.log(doTheme ? '配色: 改为 Claude 暖色' : '配色: 不改');
 
   // 始终从「当前 app.asar」读，避免 WorkBuddy 升级后从旧备份覆盖回旧版
   const { fd, header, dataStart } = readAsarHeader(target);
@@ -194,7 +237,7 @@ function ask(question) {
     else entries.push({ path: p.replace(/^\//, ''), node });
   })(header, '');
 
-  const patcher = makePatcher(F);
+  const patcher = F ? makePatcher(F) : null;
   let patched = 0;
   const packed = [];
   for (const e of entries) {
@@ -202,9 +245,15 @@ function ask(question) {
     let buf = readPackedFile(fd, dataStart, e.node);
     let modified = false;
     if (e.path.startsWith('renderer/') && (e.path.endsWith('.css') || e.path.endsWith('.html'))) {
-      const s = buf.toString('utf8');
-      let s2 = patcher(s);
-      // 在 index.html 里打标记，用于识别"已 patch"状态
+      let s = buf.toString('utf8');
+      let s2 = s;
+      // 字体补丁
+      if (patcher) s2 = patcher(s2);
+      // 配色补丁：在 cb-bridge 样式文件末尾追加 Claude 覆盖
+      if (doTheme && e.path.includes('cb-bridge') && !s2.includes(THEME_MARK)) {
+        s2 = s2 + '\n' + CLAUDE_THEME_CSS;
+      }
+      // 在 index.html 里打字体标记，用于识别"已 patch"状态
       if (e.path === 'renderer/index.html' && !s2.includes(MARK)) {
         s2 = s2.replace('</style>', '/* ' + MARK + ' */</style>');
       }
@@ -213,8 +262,8 @@ function ask(question) {
     packed.push({ path: e.path, buffer: buf, node: e.node, modified });
   }
   fs.closeSync(fd);
-  console.log('共 ' + entries.length + ' 个文件，修改字体文件 ' + patched + ' 个');
-  if (patched === 0) { console.error('✗ 没有匹配到任何字体定义，可能 WorkBuddy 版本结构有变化。'); process.exit(1); }
+  console.log('共 ' + entries.length + ' 个文件，修改 ' + patched + ' 个');
+  if (patched === 0) { console.error('✗ 没有做任何修改，可能 WorkBuddy 版本结构有变化。'); process.exit(1); }
 
   // 重算 offset，构建新 header
   let offset = 0;
@@ -253,6 +302,8 @@ function ask(question) {
   }
 
   fs.renameSync(newFile, target);
-  console.log('✓ 替换完成！请重新打开 WorkBuddy，界面字体已更换为 ' + F.trim() + '。');
-  console.log('  如需还原默认字体，运行：node workbuddy-font-patcher.js restore');
+  console.log('✓ 替换完成！请重新打开 WorkBuddy。');
+  if (F) console.log('  字体已更换为 ' + F.trim() + '。');
+  if (doTheme) console.log('  配色已改为 Claude 暖色。');
+  console.log('  如需还原，运行：node workbuddy-font-patcher.js restore');
 })().catch(e => { console.error('✗ 出错了：', e); process.exit(1); });
