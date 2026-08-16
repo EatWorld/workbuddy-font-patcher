@@ -133,7 +133,7 @@ function parseFontName(input) {
 const MARK = 'wb-font-patched';
 
 // Claude Warm 配色覆盖（仅 light 主题），追加到 cb-bridge 样式文件末尾
-const THEME_MARK = 'wb-theme-patched';
+const THEME_MARK = 'wb-claude-theme';
 const CLAUDE_THEME_CSS = `
 /* ${THEME_MARK} Claude Warm 配色覆盖（仅 light 主题） */
 body[data-vscode-theme-name="IDE Light"] {
@@ -160,6 +160,7 @@ body[data-vscode-theme-name="IDE Light"] {
   --wb-brand-primary-deep: #8a5e16;
   --wb-home-bg-primary: #f0eee6;
   --wb-home-bg-secondary: #f8f7f2;
+  --wb-sidebar-bg: #f6f5ef;
   --vscode-editor-background: #f8f7f2;
   --vscode-editor-foreground: #49432f;
 }
@@ -249,8 +250,10 @@ function ask(question) {
       let s2 = s;
       // 字体补丁
       if (patcher) s2 = patcher(s2);
-      // 配色补丁：在 cb-bridge 样式文件末尾追加 Claude 覆盖
-      if (doTheme && e.path.includes('cb-bridge') && !s2.includes(THEME_MARK)) {
+      // 配色补丁：在 cb-bridge 样式文件末尾追加 Claude 覆盖（先删旧块，保证可更新）
+      if (doTheme && e.path.includes('cb-bridge')) {
+        const idx = s2.indexOf('/* ' + THEME_MARK);
+        if (idx >= 0) s2 = s2.slice(0, idx).replace(/\s+$/, '');
         s2 = s2 + '\n' + CLAUDE_THEME_CSS;
       }
       // 在 index.html 里打字体标记，用于识别"已 patch"状态
