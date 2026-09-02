@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * WorkBuddy 字体 & 配色补丁工具（通用版 v2.0）
+ * WorkBuddy 字体 & 配色补丁工具（通用版 v3.0）
  * 把 WorkBuddy 桌面端界面字体改成你指定的任意字体，并可切换为 Claude 暖色配色。
  * （先确保字体已安装到系统）
  *
@@ -8,7 +8,8 @@
  *   node workbuddy-font-patcher.js "字体名"      换字体 + 配色（例如：node workbuddy-font-patcher.js "仓耳今楷03"）
  *   node workbuddy-font-patcher.js              不带参数，交互输入
  *   node workbuddy-font-patcher.js check        只体检，不做任何修改
- *   node workbuddy-font-patcher.js restore      还原为官方原始文件
+ *   node workbuddy-font-patcher.js restore      总还原（asar + exe + 校验开关全部恢复官方原样）
+ *   node workbuddy-font-patcher.js auto         更新后一键恢复（用记住的设置，无交互）
  *   node workbuddy-font-patcher.js dry "字体名"  试运行，生成新文件但不替换
  *
  * 说明：
@@ -18,6 +19,14 @@
  *   - 必须先完全退出 WorkBuddy 再运行本脚本，否则文件被占用、且要重启才生效。
  *   - 改的是"界面 UI 字体"（正文、对话、侧边栏等）；代码/等宽字体不受影响。
  *   - WorkBuddy 升级更新后修改会被覆盖，重新跑一次即可。
+ *
+ * v3.0 变更（适配 5.5.x，解决"改完打不开"）：
+ *   - 官方在 WorkBuddy.exe 里开启了 Electron 的 asar 完整性校验（EnableEmbeddedAsarIntegrityValidation），
+ *     改 app.asar 会被拒绝启动。主流程现在会先检测并自动关闭该开关（改 exe 里 1 个字节），
+ *     改界面前自动备份 exe。
+ *   - restore 升级为"总还原"：app.asar + WorkBuddy.exe + 校验开关，一次全部恢复官方原样。
+ *   - 新增 auto 模式：记住上次的字体名/配色选择，更新后无交互一键恢复。
+ *   - 记住用户选择存到配置文件，重复运行默认沿用上次选择。
  *
  * v2.0 变更（适配新版 WorkBuddy）：
  *   - 配色挂载点不再认文件名（旧版 cb-bridge 文件已被官方移除），改为按内容特征
@@ -34,7 +43,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const VERSION = '2.0';
+const VERSION = '3.0';
 
 // ==================== 1. 定位 WorkBuddy 的 app.asar ====================
 function findAppAsar() {
@@ -57,6 +66,73 @@ function findAppAsar() {
     if (c && fs.existsSync(c)) return c;
   }
   return null;
+}
+
+// 由 app.asar 路径反推 WorkBuddy.exe 路径（resources 的上一级）
+function findExeFromAsar(asarPath) {
+  const dir = path.dirname(asarPath);           // .../WorkBuddy/resources
+  const root = path.dirname(dir);               // .../WorkBuddy
+  const name = path.basename(root);
+  for (const exeName of [name + '.exe', 'WorkBuddy.exe', 'CodeBuddy.exe']) {
+    const p = path.join(root, exeName);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+// ==================== 1b. Electron fuse（asar 完整性校验开关）====================
+const FUSE_SENTINEL = 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX';
+const FUSE_ASAR_INTEGRITY_INDEX = 4;   // EnableEmbeddedAsarIntegrityValidation
+
+function findFuseWire(exePath) {
+  const fd = fs.openSync(exePath, 'r');
+  const size = fs.statSync(exePath).size;
+  const CHUNK = 8 * 1024 * 1024;
+  const target = Buffer.from(FUSE_SENTINEL, 'ascii');
+  let found = -1, pos = 0;
+  try {
+    while (pos < size) {
+      const len = Math.min(CHUNK + target.length, size - pos);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, pos);
+      const i = buf.indexOf(target);
+      if (i >= 0) { found = pos + i; break; }
+      pos += CHUNK;
+    }
+  } finally { fs.closeSync(fd); }
+  return found;
+}
+
+// 返回 true = 校验开启（改 asar 会打不开）；false = 已关闭；null = 无 fuse wire
+function isAsarIntegrityOn(exePath) {
+  try {
+    const wire = findFuseWire(exePath);
+    if (wire < 0) return null;
+    const fd = fs.openSync(exePath, 'r');
+    let ch;
+    try {
+      const meta = Buffer.alloc(2);
+      fs.readSync(fd, meta, 0, 2, wire + FUSE_SENTINEL.length);
+      const b = Buffer.alloc(1);
+      fs.readSync(fd, b, 0, 1, wire + FUSE_SENTINEL.length + 2 + FUSE_ASAR_INTEGRITY_INDEX);
+      ch = String.fromCharCode(b[0]);
+    } finally { fs.closeSync(fd); }
+    return ch === '1';
+  } catch (e) { return null; }
+}
+
+// ==================== 1c. 配置记忆（更新后一键恢复）====================
+function configFile() {
+  return path.join(__dirname, 'font-patcher-config.json');
+}
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(configFile(), 'utf8')); }
+  catch (e) { return {}; }
+}
+function saveConfig(obj) {
+  try {
+    fs.writeFileSync(configFile(), JSON.stringify(obj, null, 2), 'utf8');
+  } catch (e) { /* 配置文件写不了不影响主流程 */ }
 }
 
 // ==================== 2. asar 读写（自包含实现，零依赖）====================
@@ -245,22 +321,71 @@ function ask(question) {
 
   const backup = target + '.backup';
 
-  // ---------- restore ----------
-  if (arg === 'restore') {
+  // ---------- restore：总还原（asar + exe + 校验开关，全部回到官方原样）----------
+  if (arg === 'restore' || arg === 'restore-all') {
+    const FORCE = process.argv.includes('--force') || process.argv.includes('-y');
+    const exePath = findExeFromAsar(target);
+    const exeBackup = exePath ? exePath + '.backup' : null;
+
+    console.log('\n===== 总还原 =====');
+    console.log('将把 WorkBuddy 恢复成官方原样：');
+    console.log('  1) 界面字体 / 配色  → 官方默认');
+    if (exeBackup && fs.existsSync(exeBackup)) {
+      console.log('  2) WorkBuddy.exe   → 官方原版（asar 校验开关恢复开启）');
+    } else {
+      console.log('  2) WorkBuddy.exe   → 无需还原（没有 exe 备份，说明没改过）');
+    }
+    console.log('');
+
+    if (!FORCE) {
+      const ok = await ask('确定还原吗？(y/n)：');
+      if (!ok || !ok.toLowerCase().startsWith('y')) { console.log('已取消，未做任何修改。'); process.exit(0); }
+    }
+
+    // 1) 还原 app.asar
     if (!fs.existsSync(backup)) {
-      console.error('✗ 没找到备份文件 ' + backup + '，无法还原。');
+      console.error('\n✗ 没找到 asar 备份 ' + backup + '，无法还原界面。');
+      console.error('  如果 WorkBuddy 已经打不开，建议直接重装 WorkBuddy。');
       process.exit(1);
     }
-    const s1 = fs.statSync(backup).size, s2 = fs.statSync(target).size;
-    if (Math.abs(s1 - s2) > s2 * 0.1) {
-      console.log('⚠ 注意：备份文件与当前文件大小差异较大（' +
-        (s1 / 1048576).toFixed(0) + 'MB vs ' + (s2 / 1048576).toFixed(0) + 'MB），');
-      console.log('  备份可能是旧版本的。还原后将回到备份对应的那个版本。');
-      const ok = await ask('  确定继续还原？(y/n)：');
-      if (!ok || !ok.toLowerCase().startsWith('y')) { console.log('已取消。'); process.exit(0); }
+    try {
+      fs.copyFileSync(backup, target);
+      console.log('✓ 界面已还原为官方默认（字体 / 配色）');
+    } catch (e) {
+      console.error('✗ 还原 app.asar 失败: ' + e.code + ' - ' + e.message);
+      if (e.code === 'EBUSY' || e.code === 'EPERM') {
+        console.error('  请【完全退出 WorkBuddy】后重试（右下角托盘图标右键 → 退出）。');
+      }
+      process.exit(1);
     }
-    fs.copyFileSync(backup, target);
-    console.log('✓ 已还原为官方原始文件，请重新打开 WorkBuddy。');
+
+    // 2) 还原 WorkBuddy.exe（把 asar 校验开关恢复成官方原样）
+    if (exeBackup && fs.existsSync(exeBackup)) {
+      try {
+        fs.copyFileSync(exeBackup, exePath);
+        console.log('✓ WorkBuddy.exe 已还原为官方原版');
+      } catch (e) {
+        console.error('✗ 还原 WorkBuddy.exe 失败: ' + e.code + ' - ' + e.message);
+        if (e.code === 'EBUSY' || e.code === 'EPERM') {
+          console.error('  ⚠ 程序文件被占用，请【完全退出 WorkBuddy】后重新运行本还原。');
+          console.error('    界面已还原，但 exe 还是改过的状态。');
+        }
+        process.exit(1);
+      }
+    }
+
+    // 3) 清理配置里记住的选择，避免下次一键恢复又改回去
+    try {
+      const cfg = loadConfig();
+      if (cfg.font || cfg.theme) {
+        delete cfg.font; delete cfg.theme;
+        saveConfig(cfg);
+        console.log('✓ 已清除记住的字体 / 配色设置');
+      }
+    } catch (e) { /* 忽略 */ }
+
+    console.log('\n✓ 全部还原完成，现在 WorkBuddy 是 100% 官方原版状态。');
+    console.log('  请重新打开 WorkBuddy。');
     process.exit(0);
   }
 
@@ -278,14 +403,34 @@ function ask(question) {
     console.log('字体补丁状态   : ' + (stat.font ? '✅ 已打补丁' : '— 未打补丁（官方原版）'));
     console.log('配色补丁状态   : ' + (stat.theme.length ? '✅ 已打补丁 → ' + stat.theme.join(', ') : '— 未打补丁（官方原版）'));
     console.log('备份文件       : ' + (fs.existsSync(backup) ? '✅ 存在' : '❌ 不存在'));
+    const exeC = findExeFromAsar(target);
+    const fuseOn = exeC ? isAsarIntegrityOn(exeC) : null;
+    console.log('asar 校验开关  : ' + (fuseOn === null ? '— 未检测到（无需处理）'
+      : (fuseOn ? '❌ 开启中 → 改界面会导致打不开，需先关闭'
+                : '✅ 已关闭 → 可以安全修改界面')));
+    if (exeC) console.log('exe 备份       : ' + (fs.existsSync(exeC + '.backup') ? '✅ 存在' : '— 未备份'));
     closeAsar(cur);
     process.exit(0);
   }
 
+  // ---------- 模式判断 ----------
+  const AUTO = arg === 'auto' || arg === 'restore-config'; // 无交互，直接用记住的配置
+  const cfg = loadConfig();
+
   // ---------- 交互：字体名 ----------
   let fontInput = fontArg;
+  if (AUTO) {
+    fontInput = cfg.font || '';
+    console.log('[自动模式] 字体: ' + (fontInput || '不改'));
+    if (!fontInput && !cfg.theme) {
+      console.error('\n✗ 没有记住任何设置。请先运行「改字体.bat」设置一次。');
+      closeAsar(cur); process.exit(1);
+    }
+  }
   if (fontInput === undefined || fontInput === '') {
-    fontInput = await ask('[1/2] 字体名（直接回车 = 不改字体；要精确，例如：仓耳今楷03 / 霞鹜文楷）：');
+    const hint = cfg.font ? '（直接回车 = 用上次的「' + cfg.font + '」）' : '（直接回车 = 不改字体）';
+    fontInput = await ask('[1/2] 字体名' + hint + '：');
+    if (!fontInput.trim() && cfg.font) fontInput = cfg.font;
   }
   let F = null;
   if (fontInput && fontInput.trim()) {
@@ -294,14 +439,68 @@ function ask(question) {
   }
 
   // ---------- 交互：配色 ----------
-  let doTheme = true;
-  const themeAns = await ask('[2/2] 改成 Claude 暖色配色？(y/n，默认 y)：');
-  if (themeAns && themeAns.toLowerCase().startsWith('n')) doTheme = false;
+  let doTheme;
+  if (AUTO) {
+    doTheme = cfg.theme !== false;
+    console.log('[自动模式] 配色: ' + (doTheme ? 'Claude 暖色' : '不改'));
+  } else {
+    const tHint = cfg.theme === false ? '，直接回车 = 不改' : '，直接回车 = 改';
+    const themeAns = await ask('[2/2] 改成 Claude 暖色配色？(y/n' + tHint + ')：');
+    if (themeAns && themeAns.trim()) doTheme = !themeAns.toLowerCase().startsWith('n');
+    else doTheme = cfg.theme !== false;
+  }
 
   console.log('----------------------------------------');
   console.log(F ? ('字体: ' + F.trim()) : '字体: 不改');
   console.log(doTheme ? '配色: 改为 Claude 暖色' : '配色: 不改');
   if (!F && !doTheme) { console.log('未选择任何改动，退出。'); closeAsar(cur); process.exit(0); }
+
+  // ---------- 检查 / 关闭 asar 完整性校验开关 ----------
+  // 新版 WorkBuddy 在 exe 里开了 Electron 的 EnableEmbeddedAsarIntegrityValidation，
+  // 开启时改 app.asar 会导致启动被拒，必须先关掉（改 exe 里 1 个字节）。
+  const exePath = findExeFromAsar(target);
+  if (exePath) {
+    const fuseOn = isAsarIntegrityOn(exePath);
+    if (fuseOn === true) {
+      console.log('----------------------------------------');
+      console.log('⚠ 检测到 WorkBuddy 开启了 asar 完整性校验。');
+      console.log('  不动这个开关的话，改完界面 WorkBuddy 会打不开（这是上次打不开的原因）。');
+      const exeBackup = exePath + '.backup';
+      if (!fs.existsSync(exeBackup)) {
+        console.log('  正在备份 WorkBuddy.exe（约 195 MB，请稍候）...');
+        try { fs.copyFileSync(exePath, exeBackup); console.log('  ✓ 已备份 → ' + exeBackup); }
+        catch (e) {
+          console.error('  ✗ 备份 exe 失败: ' + e.message);
+          console.error('  未做任何修改，你的 WorkBuddy 是安全的。');
+          closeAsar(cur); process.exit(1);
+        }
+      } else {
+        console.log('  · exe 备份已存在，跳过备份。');
+      }
+      const wire = findFuseWire(exePath);
+      const byteOff = wire + FUSE_SENTINEL.length + 2 + FUSE_ASAR_INTEGRITY_INDEX;
+      try {
+        const rw = fs.openSync(exePath, 'r+');
+        try { fs.writeSync(rw, Buffer.from([0x30]), 0, 1, byteOff); } finally { fs.closeSync(rw); }
+      } catch (e) {
+        if (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES') {
+          console.error('\n✗ 无法修改 WorkBuddy.exe：文件被占用。');
+          console.error('  请【完全退出 WorkBuddy】（右下角托盘图标右键 → 退出，不是关窗口），');
+          console.error('  然后重新运行本脚本。');
+          console.error('  未做任何修改，你的 WorkBuddy 现在是安全的。');
+          closeAsar(cur); process.exit(1);
+        }
+        throw e;
+      }
+      if (isAsarIntegrityOn(exePath)) {
+        console.error('✗ 关闭校验开关失败（回读仍为开启）。未改 asar，你的 WorkBuddy 是安全的。');
+        closeAsar(cur); process.exit(1);
+      }
+      console.log('  ✓ 校验开关已关闭。');
+    } else if (fuseOn === false) {
+      console.log('· asar 校验开关已是关闭状态，可以直接修改界面。');
+    }
+  }
 
   // ---------- 决定基底：已打补丁就以备份为基底，避免重复叠加 ----------
   let base;
@@ -412,9 +611,18 @@ function ask(question) {
   }
 
   fs.renameSync(newFile, target);
+
+  // 记住这次的选择，WorkBuddy 更新后可一键恢复
+  saveConfig({
+    font: F ? fontInput.trim() : '',
+    theme: doTheme,
+    savedAt: new Date().toISOString(),
+  });
+
   console.log('\n✓ 替换完成！请重新打开 WorkBuddy。');
   if (F) console.log('  字体已更换为 ' + F.trim() + '。');
   if (doTheme) console.log('  配色已改为 Claude 暖色。');
+  console.log('  设置已记住。以后 WorkBuddy 更新后，双击「一键恢复.bat」即可全部恢复。');
   console.log('  如需还原，运行：node workbuddy-font-patcher.js restore');
   console.log('  如需体检，运行：node workbuddy-font-patcher.js check');
 })().catch(e => { console.error('✗ 出错了：', e); process.exit(1); });
