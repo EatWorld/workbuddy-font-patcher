@@ -6,10 +6,9 @@
 
 ## 原理
 
-WorkBuddy 是基于 Electron 的桌面应用，界面字体和配色硬编码在安装目录的 `app.asar` 文件里（CSS 变量的字体栈 + 设计 token）。本脚本：
+WorkBuddy 是基于 Electron 的桌面应用，界面字体和配色硬编码在安装目录的 `app.asar` 文件里（CSS 变量的字体栈 + 设计 token）。**新版 WorkBuddy（5.5.x）在 `WorkBuddy.exe` 里又开启了 Electron 的 `EnableEmbeddedAsarIntegrityValidation`**，改 `app.asar` 直接拒绝启动。本工具：
 
-1. **关闭界面校验开关**：新版 WorkBuddy（5.5.x）在 `WorkBuddy.exe` 里开了 Electron 的
-   `EnableEmbeddedAsarIntegrityValidation`，一旦改了 `app.asar` 就拒绝启动。本脚本会先把它关掉（改 exe 里 1 个字节）；
+1. **关掉校验开关**：改 `WorkBuddy.exe` 里 1 个字节（改前自动备份 exe）；
 2. 解析 `app.asar`（自包含解析逻辑，**零第三方依赖**，只要电脑有 Node.js 就能跑）；
 3. **字体**：把你指定的字体名加进界面字体栈的最前面；
 4. **配色**：在设计 token 主文件末尾追加一段 light 主题的变量覆盖；
@@ -27,24 +26,29 @@ WorkBuddy 是基于 Electron 的桌面应用，界面字体和配色硬编码在
 
 ### 方式一：双击运行（最简单）
 
-> **新版 WorkBuddy（5.5.x 及以上）必须按两步走。** 官方在程序里加了校验，直接改界面会导致打不开。
+**所有操作都从一个入口开始：双击 `wb-toolbox.bat`**（仓库里叫这个；你本地的副本可能叫"工具箱.bat"）。
 
-1. **完全退出 WorkBuddy**（右下角托盘图标右键 → 退出，不是关窗口）。
-2. **第 1 步**：双击 `fuse-off.bat`，把官方的界面校验开关关掉。
-3. **重新打开 WorkBuddy，确认能正常启动。**（这一步很重要，确认没问题再往下走）
-4. 再次**完全退出 WorkBuddy**。
-5. **第 2 步**：双击 `patch-font.bat`。
-   - 输入字体名，直接回车 = 用上次的选择（例如 `仓耳今楷03` 或 `霞鹜文楷`）；
-   - 是否改成 Claude 暖色配色，直接回车 = 改。
-6. 等窗口显示「替换完成」，重新打开 WorkBuddy 即可。
+弹出菜单：
 
-> 嫌两步麻烦？直接双击 `patch-font.bat` 也行——它会自己检测到校验开关还开着，自动关掉再改，
-> 全程一步完成。分两步走只是为了**先把风险切小**：万一第 1 步就出问题，界面还没动过。
+```
+[1] 改字体 + 配色（手动输入字体名）
+[2] 更新后一键恢复（用上次的选择）
+[3] 体检（只看当前状态，不改任何东西）
+[4] 还原官方原样（字体配色、程序文件全部恢复默认）
+```
+
+**首次使用**：选 `1`，按提示输入字体名（直接回车 = 用上次的选择），配色那步直接回车即可。会**自动**先关校验开关再改字体配色——不需要分两步。
+
+**WorkBuddy 更新后**：选 `2`，用记住的选择一键恢复，全程无交互。
+
+**恢复到默认**：选 `4`，把字体、配色、exe 校验开关一次性全还原。
+
+> ⚠ 改字体/恢复前**记得先完全退出 WorkBuddy**（托盘图标右键 → 退出，不是关窗口）。脚本检测到程序在跑会直接停手，不会破坏任何文件。
 
 ### 方式二：命令行
 
 ```bash
-# 换字体 + 改配色（会自动处理校验开关）
+# 换字体 + 改配色（自动处理校验开关）
 node workbuddy-font-patcher.js "仓耳今楷03"
 
 # 换多个字体（第一个优先，找不到就回退到第二个）
@@ -62,7 +66,7 @@ node workbuddy-font-patcher.js auto
 node workbuddy-font-patcher.js restore
 ```
 
-校验开关也可以单独操作（对应 `fuse-off.bat`）：
+校验开关也可以单独操作：
 
 ```bash
 node workbuddy-fuse-tool.js status    # 只看状态
@@ -96,36 +100,35 @@ node workbuddy-fuse-tool.js restore   # 用备份还原整个 exe
 ## 注意事项
 
 - **必须先完全退出 WorkBuddy 再运行**，否则文件被占用、且要重启才生效。脚本检测到程序在运行会直接停手，不会破坏任何文件。
-- **WorkBuddy 升级更新后，字体、配色、校验开关都会被官方恢复原样**，重新跑一次即可。
-  - 升级后最省事：双击 `auto-restore.bat`，用记住的设置一键全部恢复（关开关 + 字体 + 配色），全程无交互。
-  - 脚本会检测到升级并自动刷新备份，不会拿旧备份覆盖新版。
-  - 重复运行不会把字体名叠加（自动以原始备份为基底重新生成）。
-- 脚本会自动备份原文件（`app.asar.backup` + `WorkBuddy.exe.backup`），还原时用 `restore-font.bat`（或命令行 `restore`）即可。
-- 只测过 **Windows**。macOS 的安装路径已内置探测，但未经实测；如找不到，欢迎提 issue。
+- **WorkBuddy 升级更新后，字体、配色、校验开关都会被官方恢复原样**——这是官方程序决定的，本工具没法提前预防。脚本会自动检测升级并刷新备份（避免"还原"退回旧版本）。
+- 脚本会自动备份原文件（`app.asar.backup` + `WorkBuddy.exe.backup`）。
+- 重复运行不会把字体名叠加（自动以原始备份为基底重新生成）。
+- 只测过 **Windows**。macOS 的安装路径已内置探测，但 bat 入口未做跨平台，建议 macOS 用户走命令行。
 
 ## 升级后失效了怎么办
 
-先跑体检看看：
+1. 退出 WorkBuddy
+2. 双击 `wb-toolbox.bat`，选 `2`（一键恢复）
+3. 完成
 
-```bash
-node workbuddy-font-patcher.js check
-```
+如果一键恢复不动，先跑体检看看原因（菜单里 `3`，或命令行 `node workbuddy-font-patcher.js check`）。它会输出：版本、token 主文件位置、字体补丁状态、配色补丁状态、**校验开关状态**。
 
-它会告诉你有没有找到「设计 token 主文件」，以及**校验开关当前的状态**。正常应该显示类似：
+体检输出里关键两行：
 
 ```
 token 主文件   : renderer/assets/safe-delete-events-XXXX.css
-asar 校验开关  : ❌ 开启中 → 改界面会导致打不开，需先关闭
+asar 校验开关  : ❌ 开启中 → 改界面会导致打不开
 ```
 
-- 如果校验开关显示「开启中」：升级后官方把它恢复了，直接双击 `patch-font.bat` 会自动关掉再改。
-- 如果显示「未找到 token 主文件」：说明官方又改了结构，把体检结果贴到 issue 里即可。想看得更细，可以用自带的诊断脚本：
+- 如果校验开关显示「开启中」：说明官方更新后把它恢复了，**自动恢复会一并处理**，不用管。
+- 如果显示「未找到 token 主文件」：说明官方又改了 CSS 结构，把体检输出贴到 issue 里。
+
+想自己深入定位（只读不改），可以用仓库带的诊断脚本：
 
 ```bash
-node tools/asar-probe.js
+node tools/asar-probe.js   # 输出 asar 结构与挂载点信息
+node tools/fuse-check.js   # 探测 exe 的 fuse 校验开关状态
 ```
-
-它会输出 asar 概况、token 主文件位置、字体变量定义在哪几个文件、CSS 加载顺序、主题选择器分布、补丁状态等，只读不改，方便你自己定位新挂载点。
 
 > 本工具的配色挂载点是**按内容特征自动识别**的（找定义 `--wb-palette-brand-8` 的那个 CSS），不认文件名，所以官方改文件名不会导致失效。
 
@@ -133,36 +136,36 @@ node tools/asar-probe.js
 
 | 文件 | 作用 |
 |---|---|
-| `patch-font.bat` | 一键换字体 + 改配色（自动处理校验开关） |
-| `fuse-off.bat` | 分两步走时的第 1 步：只关校验开关，不动字体配色 |
-| `restore-font.bat` | 总还原：字体、配色、程序文件全部恢复官方原样（有确认） |
-| `emergency-restore.bat` | 紧急还原：同上但**无交互直接执行**，用于改完打不开时 |
-| `auto-restore.bat` | WorkBuddy 更新后一键恢复字体配色（用记住的设置，无交互） |
-| `check.bat` | 一键体检，只看不改 |
+| `wb-toolbox.bat` | **唯一入口**：双击后弹菜单，按数字选操作（4 个常用操作全包了） |
 | `workbuddy-font-patcher.js` | 核心脚本（纯 Node，零依赖） |
-| `workbuddy-fuse-tool.js` | 校验开关专用工具（status / off / on / restore） |
-| `tools/asar-probe.js` | 诊断脚本，输出 asar 结构与挂载点信息（只读，排查用） |
+| `workbuddy-fuse-tool.js` | 校验开关专用工具（status / off / on / restore），主流程会自动调用 |
+| `tools/asar-probe.js` | asar 结构诊断脚本（只读），新版失效时排查挂载点 |
+| `tools/fuse-check.js` | fuse 校验开关探测（只读），判断"改完打不开"是不是校验导致的 |
 | `fonts/` | 附赠字体：仓耳今楷（5 字重，免费商用）+ 霞鹜文楷（3 字重，开源 OFL），双击 ttf 即可安装 |
+
+> 你本地的副本可能叫"工具箱.bat"——和 `wb-toolbox.bat` 是同一个文件。
 
 ## 更新日志
 
+### v3.1
+
+- 桌面端**单一入口**：`wb-toolbox.bat`（中文版叫"工具箱.bat"）合并了原 6 个分散的 bat（patch-font、restore-font、auto-restore、emergency-restore、check、fuse-off），所有操作一个菜单走完。
+- bat 强化：用 GBK + CRLF 编码（Windows 中文 cmd 友好），`chcp 65001` 已移除（旧版在密集中文 echo 下渲染不稳）。
+- 仓库清理：移除冗余英文 bat，只保留 `wb-toolbox.bat` 一个入口文件。
+
 ### v3.0
 
-- **解决「改完打不开」**：官方在 `WorkBuddy.exe` 里开启了 Electron 的 asar 完整性校验
-  （`EnableEmbeddedAsarIntegrityValidation`），改 `app.asar` 会被拒绝启动。本版主流程会先**自动检测并关闭该校验开关**
-  （改 exe 里 1 个字节，改前自动备份 exe）。
+- **解决「改完打不开」**：官方在 `WorkBuddy.exe` 里开启了 Electron 的 asar 完整性校验（`EnableEmbeddedAsarIntegrityValidation`），改 `app.asar` 会被拒绝启动。本版主流程会先**自动检测并关闭该校验开关**（改 exe 里 1 个字节，改前自动备份 exe）。
 - `restore` 升级为**总还原**：app.asar + WorkBuddy.exe + 校验开关，一次全部恢复官方原样，不会退回旧版本。
-- 新增 `auto` 模式（`auto-restore.bat`）：记住上次的字体名和配色选择，更新后无交互一键恢复。
-- 记住用户选择存到本地配置，重复运行默认沿用上次选择。
+- 新增 `auto` 模式：记住上次的字体名和配色选择，更新后无交互一键恢复。
 
 ### v2.0
 
 - 适配新版 WorkBuddy：**配色挂载点不再认文件名**（旧版 `cb-bridge` 文件已被官方移除），改为按内容特征自动识别设计 token 主文件。
 - 配色变量加 `!important`，防止官方调整 CSS 加载顺序导致失效。
-- 重复运行不再叠加字体名。
 - WorkBuddy 升级后自动刷新备份，避免「还原」退回旧版本。
 - 新增 `check` 体检模式。
 
 ## 免责声明
 
-本工具通过修改本地安装的程序文件实现，属于非官方手段，仅供个人美化使用。使用前会自动备份，但请知悉：改动程序文件有极小概率导致异常（可随时 `restore` 还原）；WorkBuddy 升级后需重新应用。
+本工具通过修改本地安装的程序文件实现，属于非官方手段，仅供个人美化使用。使用前会自动备份，但请知悉：改动程序文件有极小概率导致异常（可随时 `wb-toolbox.bat → 4` 还原）；WorkBuddy 升级后需重新应用。
