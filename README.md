@@ -96,7 +96,13 @@ node workbuddy-font-patcher.js check
 token 主文件   : renderer/assets/safe-delete-events-XXXX.css
 ```
 
-如果显示「未找到」，说明官方又改了结构，把体检结果贴到 issue 里即可。
+如果显示「未找到」，说明官方又改了结构，把体检结果贴到 issue 里即可。想看得更细，可以用自带的诊断脚本：
+
+```bash
+node tools/asar-probe.js
+```
+
+它会输出 asar 概况、token 主文件位置、字体变量定义在哪几个文件、CSS 加载顺序、主题选择器分布、补丁状态等，只读不改，方便你自己定位新挂载点。
 
 > 本工具的配色挂载点是**按内容特征自动识别**的（找定义 `--wb-palette-brand-8` 的那个 CSS），不认文件名，所以官方改文件名不会导致失效。
 
@@ -108,6 +114,7 @@ token 主文件   : renderer/assets/safe-delete-events-XXXX.css
 | `restore-font.bat` | 一键还原官方原始文件 |
 | `check.bat` | 一键体检，只看不改 |
 | `workbuddy-font-patcher.js` | 核心脚本（纯 Node，零依赖） |
+| `tools/asar-probe.js` | 诊断脚本，输出 asar 结构与挂载点信息（只读，排查用） |
 | `fonts/` | 附赠字体：仓耳今楷（5 字重，免费商用）+ 霞鹜文楷（3 字重，开源 OFL），双击 ttf 即可安装 |
 
 ## 更新日志
