@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * WorkBuddy 字体 & 配色补丁工具（通用版 v3.0）
+ * WorkBuddy 字体 & 配色补丁工具（通用版 v3.1）
  * 把 WorkBuddy 桌面端界面字体改成你指定的任意字体，并可切换为 Claude 暖色配色。
  * （先确保字体已安装到系统）
  *
@@ -19,6 +19,12 @@
  *   - 必须先完全退出 WorkBuddy 再运行本脚本，否则文件被占用、且要重启才生效。
  *   - 改的是"界面 UI 字体"（正文、对话、侧边栏等）；代码/等宽字体不受影响。
  *   - WorkBuddy 升级更新后修改会被覆盖，重新跑一次即可。
+ *
+ * v3.1 变更（修复一个会导致"退回旧程序"的隐患）：
+ *   - exe 备份加入"过期检测"：WorkBuddy 升级后 exe 会换新，但旧 .backup 还留着。
+ *     原逻辑只看备份在不在，还原时会拿旧版 exe 覆盖新版，导致程序与新版 asar 不匹配。
+ *     现在会比较内容（大小 + MD5），过期则自动刷新；还原时若备份已过期会直接跳过并说明。
+ *   - check 体检会明确标出 exe 备份是否已过期。
  *
  * v3.0 变更（适配 5.5.x，解决"改完打不开"）：
  *   - 官方在 WorkBuddy.exe 里开启了 Electron 的 asar 完整性校验（EnableEmbeddedAsarIntegrityValidation），
@@ -43,7 +49,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const VERSION = '3.0';
+const VERSION = '3.1';
 
 // ==================== 1. 定位 WorkBuddy 的 app.asar ====================
 function findAppAsar() {
@@ -122,6 +128,54 @@ function isAsarIntegrityOn(exePath) {
 }
 
 // ==================== 1c. 配置记忆（更新后一键恢复）====================
+// ---------- exe 备份的有效性检查 ----------
+// 关键：WorkBuddy 每次升级都会换掉 WorkBuddy.exe，但旧的 .backup 还留在原地。
+// 若只判断「备份是否存在」，还原时就会拿旧版 exe 覆盖新版，导致程序与新版 asar 不匹配。
+// 所以必须比对内容——大小相同也要比哈希（Electron 小版本更新常出现大小不变、内容已变）。
+function fileHash(p) {
+  const h = crypto.createHash('md5');
+  const buf = Buffer.alloc(4 * 1024 * 1024);
+  const fd = fs.openSync(p, 'r');
+  try {
+    let pos = 0;
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, pos);
+      if (n <= 0) break;
+      h.update(buf.subarray(0, n));
+      pos += n;
+    }
+  } finally { fs.closeSync(fd); }
+  return h.digest('hex');
+}
+
+// exe 备份是否已过期（与当前 exe 内容不一致 = 官方升级过了）
+function isExeBackupStale(exePath) {
+  const bak = exePath + '.backup';
+  if (!fs.existsSync(bak)) return false;
+  const s1 = fs.statSync(exePath).size, s2 = fs.statSync(bak).size;
+  if (s1 !== s2) return true;
+  return fileHash(exePath) !== fileHash(bak);
+}
+
+// 确保 exe 备份与当前 exe 一致；返回 'created' | 'refreshed' | 'ok'
+function ensureExeBackup(exePath) {
+  const bak = exePath + '.backup';
+  if (!fs.existsSync(bak)) {
+    fs.copyFileSync(exePath, bak);
+    return 'created';
+  }
+  const s1 = fs.statSync(exePath).size, s2 = fs.statSync(bak).size;
+  if (s1 !== s2) {
+    fs.copyFileSync(exePath, bak);
+    return 'refreshed';
+  }
+  if (fileHash(exePath) !== fileHash(bak)) {
+    fs.copyFileSync(exePath, bak);
+    return 'refreshed';
+  }
+  return 'ok';
+}
+
 function configFile() {
   return path.join(__dirname, 'font-patcher-config.json');
 }
@@ -327,11 +381,14 @@ function ask(question) {
     const exePath = findExeFromAsar(target);
     const exeBackup = exePath ? exePath + '.backup' : null;
 
+    const exeStale = (exePath && exeBackup && fs.existsSync(exeBackup)) ? isExeBackupStale(exePath) : false;
     console.log('\n===== 总还原 =====');
     console.log('将把 WorkBuddy 恢复成官方原样：');
     console.log('  1) 界面字体 / 配色  → 官方默认');
-    if (exeBackup && fs.existsSync(exeBackup)) {
+    if (exeBackup && fs.existsSync(exeBackup) && !exeStale) {
       console.log('  2) WorkBuddy.exe   → 官方原版（asar 校验开关恢复开启）');
+    } else if (exeStale) {
+      console.log('  2) WorkBuddy.exe   → 跳过（备份是升级前的旧版本，还原会退回旧程序）');
     } else {
       console.log('  2) WorkBuddy.exe   → 无需还原（没有 exe 备份，说明没改过）');
     }
@@ -360,7 +417,10 @@ function ask(question) {
     }
 
     // 2) 还原 WorkBuddy.exe（把 asar 校验开关恢复成官方原样）
-    if (exeBackup && fs.existsSync(exeBackup)) {
+    if (exeStale) {
+      console.log('· 跳过 exe 还原：备份是升级前的旧版本，还原会让 WorkBuddy.exe 退回旧版。');
+      console.log('  当前 exe 就是官方原版，无需处理。');
+    } else if (exeBackup && fs.existsSync(exeBackup)) {
       try {
         fs.copyFileSync(exeBackup, exePath);
         console.log('✓ WorkBuddy.exe 已还原为官方原版');
@@ -408,7 +468,11 @@ function ask(question) {
     console.log('asar 校验开关  : ' + (fuseOn === null ? '— 未检测到（无需处理）'
       : (fuseOn ? '❌ 开启中 → 改界面会导致打不开，需先关闭'
                 : '✅ 已关闭 → 可以安全修改界面')));
-    if (exeC) console.log('exe 备份       : ' + (fs.existsSync(exeC + '.backup') ? '✅ 存在' : '— 未备份'));
+    if (exeC) {
+      const eb = exeC + '.backup';
+      if (!fs.existsSync(eb)) console.log('exe 备份       : — 未备份');
+      else console.log('exe 备份       : ' + (isExeBackupStale(exeC) ? '⚠ 存在但已过期（官方升级过，还原时会自动跳过）' : '✅ 有效'));
+    }
     closeAsar(cur);
     process.exit(0);
   }
@@ -466,16 +530,15 @@ function ask(question) {
       console.log('⚠ 检测到 WorkBuddy 开启了 asar 完整性校验。');
       console.log('  不动这个开关的话，改完界面 WorkBuddy 会打不开（这是上次打不开的原因）。');
       const exeBackup = exePath + '.backup';
-      if (!fs.existsSync(exeBackup)) {
-        console.log('  正在备份 WorkBuddy.exe（约 195 MB，请稍候）...');
-        try { fs.copyFileSync(exePath, exeBackup); console.log('  ✓ 已备份 → ' + exeBackup); }
-        catch (e) {
-          console.error('  ✗ 备份 exe 失败: ' + e.message);
-          console.error('  未做任何修改，你的 WorkBuddy 是安全的。');
-          closeAsar(cur); process.exit(1);
-        }
-      } else {
-        console.log('  · exe 备份已存在，跳过备份。');
+      try {
+        const bs = ensureExeBackup(exePath);
+        if (bs === 'created') console.log('  ✓ 已备份 WorkBuddy.exe（约 195 MB）→ ' + exeBackup);
+        else if (bs === 'refreshed') console.log('  ✓ 检测到 WorkBuddy 已升级，exe 备份已刷新为新版（避免还原时退回旧版本）');
+        else console.log('  · exe 备份有效，跳过。');
+      } catch (e) {
+        console.error('  ✗ 备份 exe 失败: ' + e.message);
+        console.error('  未做任何修改，你的 WorkBuddy 是安全的。');
+        closeAsar(cur); process.exit(1);
       }
       const wire = findFuseWire(exePath);
       const byteOff = wire + FUSE_SENTINEL.length + 2 + FUSE_ASAR_INTEGRITY_INDEX;

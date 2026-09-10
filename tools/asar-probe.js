@@ -174,13 +174,51 @@ console.log('\n【7】配套检查');
 const dir = path.dirname(target);
 const backup = target + '.backup';
 console.log('  备份文件: ' + (fs.existsSync(backup) ? '✅ 存在 (' + (fs.statSync(backup).size / 1048576).toFixed(1) + ' MB)' : '❌ 不存在'));
-const logFile = path.join(path.dirname(dir), 'debug.log');
-if (fs.existsSync(logFile)) {
-  const log = fs.readFileSync(logFile, 'utf8');
-  const bad = /asar|integrity|corrupt/i.test(log);
-  console.log('  启动日志 asar 校验: ' + (bad ? '⚠ 发现相关字眼，需人工确认' : '✅ 无校验/自愈痕迹（改 asar 安全）'));
+// 检测 exe 的 fuse 开关 —— 这才是在新版上决定「改 asar 会不会导致打不开」的关键。
+// 千万不要靠 debug.log 来判断：完整性校验在日志系统初始化之前就拒绝启动，
+// 日志里看不到任何痕迹，据此判断会得出完全相反的结论。
+const exe = path.join(path.dirname(dir), process.platform === 'win32' ? 'WorkBuddy.exe' : 'WorkBuddy');
+console.log('  exe 备份  : ' + (fs.existsSync(exe + '.backup') ? '✅ 存在' : '❌ 不存在'));
+if (fs.existsSync(exe)) {
+  try {
+    const st = fs.statSync(exe);
+    const fdE = fs.openSync(exe, 'r');
+    const needle = Buffer.from('dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX', 'ascii');
+    const CHUNK = 8 * 1024 * 1024;
+    let found = -1, pos = 0;
+    while (pos < st.size) {
+      const len = Math.min(CHUNK + needle.length, st.size - pos);
+      const b = Buffer.alloc(len);
+      fs.readSync(fdE, b, 0, len, pos);
+      const i = b.indexOf(needle);
+      if (i >= 0) { found = pos + i; break; }
+      pos += CHUNK;
+    }
+    if (found < 0) {
+      console.log('  asar 校验开关: 未找到 fuse sentinel（较老版本，通常无需处理）');
+    } else {
+      const meta = Buffer.alloc(2);
+      fs.readSync(fdE, meta, 0, 2, found + needle.length);
+      const dataLen = meta[1];
+      const data = Buffer.alloc(dataLen);
+      fs.readSync(fdE, data, 0, dataLen, found + needle.length + 2);
+      // fuse wire v1 第 5 项 (index 4) = EnableEmbeddedAsarIntegrityValidation
+      const IDX = 4;
+      const c = dataLen > IDX ? String.fromCharCode(data[IDX]) : '?';
+      if (c === '1') {
+        console.log('  asar 校验开关: ❌ 开启中 → 改界面会导致打不开（补丁脚本会先自动关闭）');
+      } else if (c === '0') {
+        console.log('  asar 校验开关: ✅ 已关闭 → 可安全修改界面');
+      } else {
+        console.log('  asar 校验开关: ⚠ 状态异常 (' + c + ')，用 fuse-check.js 详查');
+      }
+    }
+    fs.closeSync(fdE);
+  } catch (e) {
+    console.log('  asar 校验开关: ⚠ 检测失败 → ' + e.message);
+  }
 } else {
-  console.log('  启动日志: 未找到 debug.log');
+  console.log('  asar 校验开关: 未找到可执行文件，跳过');
 }
 
 console.log('\n' + ''.padEnd(64, '='));

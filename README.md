@@ -149,6 +149,9 @@ node tools/fuse-check.js   # 探测 exe 的 fuse 校验开关状态
 
 ### v3.1
 
+- **修复一个会导致「程序退回旧版本」的隐患**：WorkBuddy 升级后会换掉 `WorkBuddy.exe`，但旧的 `.backup` 还留在原处。原逻辑只看备份是否存在，于是在这种"备份存在但已过期"的情况下，还原会拿**旧版 exe 覆盖新版**，导致程序与新版 `app.asar` 不匹配。现在 exe 备份带**过期检测**（比对大小 + MD5，Electron 小版本更新常出现大小不变但内容已变），过期时自动刷新；还原时若备份已过期会直接跳过并说明。体检也会明确标出备份状态。
+- 诊断脚本 `tools/asar-probe.js` 修正一处**已被证伪的判断**：不再根据 `debug.log` 里有无 asar 字眼来判断"能否安全修改"，改为真实读取 exe 的 fuse 开关。新版校验在日志系统初始化前就拒绝启动，日志里根本看不到痕迹，原判断会得出完全相反的结论。
+- 诊断脚本 `tools/fuse-check.js` 移除硬编码的本机路径，改为自动探测（其他人下载后可直接使用）。
 - 桌面端**单一入口**：`wb-toolbox.bat`（中文版叫"工具箱.bat"）合并了原 6 个分散的 bat（patch-font、restore-font、auto-restore、emergency-restore、check、fuse-off），所有操作一个菜单走完。
 - bat 强化：用 GBK + CRLF 编码（Windows 中文 cmd 友好），`chcp 65001` 已移除（旧版在密集中文 echo 下渲染不稳）。
 - 仓库清理：移除冗余英文 bat，只保留 `wb-toolbox.bat` 一个入口文件。
