@@ -26,6 +26,7 @@ echo    [1] 改字体 + 配色（手动输入字体名）
 echo    [2] 更新后一键恢复（自动用上次的选择，最常用）
 echo    [3] 体检（只看当前状态，不改任何东西）
 echo    [4] 还原官方原样（字体配色、程序文件全部恢复默认）
+echo    [5] 查字体真实名字（改了没效果时先用这个）
 echo.
 echo    提示：改字体/恢复前，记得先完全退出 WorkBuddy
 echo    直接回车 = 退出
@@ -38,6 +39,7 @@ if "%choice%"=="1" goto do_font
 if "%choice%"=="2" goto do_auto
 if "%choice%"=="3" goto do_check
 if "%choice%"=="4" goto do_restore
+if "%choice%"=="5" goto do_fontname
 echo 无效输入（%choice%），请重新输入
 pause
 goto menu
@@ -46,6 +48,12 @@ goto menu
 echo.
 echo ===== 改字体 + 配色 =====
 echo 提示：请先完全退出 WorkBuddy 再继续（会自动处理校验开关）
+echo.
+echo 注意：字体名必须和系统里的【真实家族名】一字不差。
+echo       比如装了「仓耳今楷03-W04.ttf」，它的真实名字是
+echo       「仓耳今楷03 W04」而不是「仓耳今楷03」。
+echo       填错了字体不会报错，只会静默回退成默认字体，
+echo       看着像改了其实没生效。不确定就先选 [5] 查。
 pause
 "%NODE%" "%~dp0workbuddy-font-patcher.js"
 goto end
@@ -72,6 +80,17 @@ echo 会还原：界面字体/配色 + WorkBuddy.exe（校验开关也恢复官方状态）
 echo 提示：请先完全退出 WorkBuddy 再继续
 pause
 "%NODE%" "%~dp0workbuddy-font-patcher.js" restore
+goto end
+
+:do_fontname
+echo.
+echo ===== 查字体真实名字 =====
+echo 输入关键词（如 仓耳、苹方、LXGW）可模糊匹配
+echo 直接回车 = 列出系统里所有带中文名的字体
+echo.
+set "fkw="
+set /p fkw=关键词： 
+"%NODE%" "%~dp0font-resolver.js" %fkw%
 goto end
 
 :end
