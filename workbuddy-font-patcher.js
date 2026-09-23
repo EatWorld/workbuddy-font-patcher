@@ -20,6 +20,13 @@
  *   - 改的是"界面 UI 字体"（正文、对话、侧边栏等）；代码/等宽字体不受影响。
  *   - WorkBuddy 升级更新后修改会被覆盖，重新跑一次即可。
  *
+ * v3.3 变更（新增字体名校验，防止"改了没生效"）：
+ *   - 打补丁前校验字体名是否真能被浏览器识别。TTF 常有两套家族名——
+ *     nid=1(Family，GDI 用) 与 nid=16(TypographicFamily，Chromium 用)。
+ *     填了 nid=1 的名字（如「仓耳今楷03 W04」）浏览器认不出，会静默回退默认字体，
+ *     不报错、看着像改了。现在会提前警告并给出建议名，需确认才继续。
+ *   - 支持 --force / -y 跳过确认（auto 模式自动跳过）。
+ *
  * v3.1 变更（修复一个会导致"退回旧程序"的隐患）：
  *   - exe 备份加入"过期检测"：WorkBuddy 升级后 exe 会换新，但旧 .backup 还留着。
  *     原逻辑只看备份在不在，还原时会拿旧版 exe 覆盖新版，导致程序与新版 asar 不匹配。
@@ -49,7 +56,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const VERSION = '3.1';
+const VERSION = '3.3';
 
 // ==================== 1. 定位 WorkBuddy 的 app.asar ====================
 function findAppAsar() {
@@ -280,6 +287,105 @@ function parseFontName(input) {
   return names.map(n => '"' + n.replace(/"/g, '') + '"').join(', ') + ', ';
 }
 
+// ==================== 3b. 字体名有效性校验（2026-09-23 新增）====================
+// 背景：TTF 里常有两套家族名 —— nid=1( Family ) 与 nid=16( TypographicFamily )。
+//   GDI/注册表 用 nid=1，Chromium/DirectWrite 优先用 nid=16。
+//   填了 nid=1 的名字（如「仓耳今楷03 W04」），浏览器认不出 → 静默回退默认字体，
+//   不报任何错，看着像改了其实没生效。这里在打补丁【之前】先给出警告。
+function findInstalledFontNames() {
+  const dirs = [];
+  if (process.platform === 'win32') {
+    dirs.push('C:\\Windows\\Fonts');
+    if (process.env.LOCALAPPDATA) {
+      dirs.push(path.join(process.env.LOCALAPPDATA, 'Microsoft', 'Windows', 'Fonts'));
+    }
+  } else if (process.platform === 'darwin') {
+    dirs.push('/Library/Fonts', path.join(os.homedir(), 'Library', 'Fonts'), '/System/Library/Fonts');
+  } else {
+    dirs.push('/usr/share/fonts', path.join(os.homedir(), '.local', 'share', 'fonts'));
+  }
+
+  const fam1 = new Set(), fam16 = new Set();
+  for (const dir of dirs) {
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch (e) { continue; }
+    for (const f of files) {
+      if (!/\.(ttf|otf)$/i.test(f)) continue;
+      try {
+        const p = path.join(dir, f);
+        if (fs.statSync(p).size > 120 * 1024 * 1024) continue;
+        const buf = fs.readFileSync(p);
+        const tag = buf.toString('latin1', 0, 4);
+        if (!(tag === 'OTTO' || tag === 'true' || tag === 'typ1' || buf.readUInt32BE(0) === 0x00010000)) continue;
+        const numTables = buf.readUInt16BE(4);
+        let nameOff = -1;
+        for (let i = 0; i < numTables; i++) {
+          const rec = 12 + i * 16;
+          if (rec + 16 > buf.length) break;
+          if (buf.toString('latin1', rec, rec + 4) === 'name') { nameOff = buf.readUInt32BE(rec + 8); break; }
+        }
+        if (nameOff < 0) continue;
+        const count = buf.readUInt16BE(nameOff + 2);
+        const strOff = buf.readUInt16BE(nameOff + 4);
+        for (let i = 0; i < count; i++) {
+          const r = nameOff + 6 + i * 12;
+          if (r + 12 > buf.length) break;
+          const pid = buf.readUInt16BE(r), nid = buf.readUInt16BE(r + 6);
+          const len = buf.readUInt16BE(r + 8), off = buf.readUInt16BE(r + 10);
+          if (nid !== 1 && nid !== 16) continue;
+          const s = buf.slice(nameOff + strOff + off, nameOff + strOff + off + len);
+          let t;
+          if (pid === 3 || pid === 0) { const sw = Buffer.from(s); if (sw.length % 2) continue; sw.swap16(); t = sw.toString('utf16le'); }
+          else t = s.toString('latin1');
+          t = (t || '').replace(/\0/g, '').trim();
+          if (!t || t.length >= 80) continue;
+          (nid === 16 ? fam16 : fam1).add(t);
+        }
+      } catch (e) { /* 单个字体读失败不影响整体 */ }
+    }
+  }
+  return { fam1, fam16 };
+}
+
+// 校验字体名；返回 { ok, warn, suggestion, known }
+function verifyFontName(name) {
+  // 系统基础字体 / 通用族不校验
+  const GENERIC = /^(sans-serif|serif|monospace|system-ui|cursive|fantasy|-apple-system|BlinkMacSystemFont|Segoe UI|PingFang SC|Microsoft YaHei|SimSun|KaiTi|Arial|Helvetica|Roboto|Tahoma|Verdana)$/i;
+  if (GENERIC.test(name)) return { ok: true, known: true };
+
+  const { fam1, fam16 } = findInstalledFontNames();
+  if (fam16.has(name)) return { ok: true, known: true };        // 浏览器用名，最佳
+  if (fam1.has(name) && !fam16.has(name)) {
+    // 是 GDI 名、但浏览器可能认不出 → 找同字体文件的 nid16 浏览器用名
+    // 策略：优先「名字以候选开头」的，取最长；其次「候选被名字包含」的，取最长
+    let sug = '';
+    const prefixes = [...fam16].filter(c => c.length > 1 && name.startsWith(c));
+    if (prefixes.length) {
+      sug = prefixes.sort((a, b) => b.length - a.length)[0];
+    } else {
+      const contained = [...fam16].filter(c => c.length > 1 && name.includes(c));
+      if (contained.length) sug = contained.sort((a, b) => b.length - a.length)[0];
+    }
+    if (sug) return { ok: false, known: true, warn: '这是 GDI/注册表名，浏览器(Chromium)通常认不出，会静默回退默认字体', suggestion: sug };
+    return { ok: false, known: true, warn: '这是 GDI/注册表名，浏览器可能认不出（未找到对应的浏览器用名，建议换一个）', suggestion: '' };
+  }
+  // 两边都没有 → 可能没装
+  let sug = '';
+  const base = name.replace(/\s+W0?\d+$/i, '').replace(/[-_]\s*W0?\d+$/i, '').trim();
+  if (base && base !== name && (fam16.has(base) || fam1.has(base))) sug = base;
+  else {
+    const prefixes = [...fam16].filter(c => c.length > 1 && name.startsWith(c));
+    if (prefixes.length) sug = prefixes.sort((a, b) => b.length - a.length)[0];
+    else {
+      const norm = s => s.toLowerCase().replace(/[\s\-_]/g, '');
+      const k = norm(name);
+      const near = [...fam16].filter(c => norm(c).includes(k) || k.includes(norm(c)));
+      if (near.length) sug = near.sort((a, b) => b.length - a.length)[0];
+    }
+  }
+  return { ok: false, known: false, warn: '系统里找不到这个家族名（可能没装，或名字拼错）', suggestion: sug };
+}
+
 // 补丁标记：写进 index.html，用于识别"当前 app.asar 是否已被本工具改过"
 const MARK = 'wb-font-patched';
 const THEME_MARK = 'wb-claude-theme';
@@ -500,6 +606,32 @@ function ask(question) {
   if (fontInput && fontInput.trim()) {
     try { F = parseFontName(fontInput); }
     catch (e) { console.error('✗ ' + e.message); closeAsar(cur); process.exit(1); }
+  }
+
+  // ---------- 字体名有效性校验（防止静默回退）----------
+  if (fontInput && fontInput.trim()) {
+    const checkNames = fontInput.split(/[,，;；]/).map(s => s.trim()).filter(Boolean);
+    for (const nm of checkNames) {
+      const v = verifyFontName(nm);
+      if (v.ok) continue;
+      console.log('');
+      console.log(v.known
+        ? '⚠ 字体名校验：「' + nm + '」在系统里存在，但类型不对。'
+        : '⚠ 字体名校验：系统里没找到「' + nm + '」。');
+      console.log('  ' + v.warn);
+      if (v.suggestion) {
+        console.log('  → 建议改用：' + v.suggestion);
+      }
+      console.log('  说明：CSS 里名字对不上不会报错，只会静默回退默认字体（看着改了其实没生效）。');
+      console.log('  正确名字可用工具箱 [5]「查字体真实名字」查询（认准 ★浏览器用名）。');
+      if (!process.argv.includes('--force') && !process.argv.includes('-y') && !AUTO) {
+        const go = await ask('  仍要继续吗？(y = 继续 / 直接回车 = 取消)：');
+        if (!go || !go.toLowerCase().startsWith('y')) {
+          console.log('  已取消，未做任何修改。');
+          closeAsar(cur); process.exit(0);
+        }
+      }
+    }
   }
 
   // ---------- 交互：配色 ----------
