@@ -20,6 +20,14 @@
  *   - 改的是"界面 UI 字体"（正文、对话、侧边栏等）；代码/等宽字体不受影响。
  *   - WorkBuddy 升级更新后修改会被覆盖，重新跑一次即可。
  *
+ * v4.1 变更（重要安全修正）：
+ *   - 实测确认 5.8.3 的 renderer 资源**带完整性校验**：asar header 里 1907 个条目
+ *     全部带 integrity(SHA1)，其中 1709 个是 unpacked 文件。直接改磁盘文件会让校验失败，
+ *     表现为「界面空白 + 一直刷新」，随后官方自动还原文件。
+ *   - 因此解包模式**默认拒绝修改**，只保留 check / restore。
+ *     确需尝试必须显式加 --unsafe（高风险，会白屏）。
+ *   - 结论：5.8.3+ 不要再用本工具改界面，改用官方「外观/皮肤」设置。
+ *
  * v4.0 变更（适配 WorkBuddy 5.8.3+ 的解包结构）：
  *   - 5.8.3 起官方把 renderer/ 整体解包到 resources/app.asar.unpacked/renderer/，
  *     前端资源变成磁盘上的普通文件。脚本新增「解包模式」：直接改这些文件即可，
@@ -64,7 +72,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const VERSION = '4.0';
+const VERSION = '4.1';
 
 // ==================== 1. 定位 WorkBuddy 的 app.asar ====================
 function findAppAsar() {
@@ -641,6 +649,25 @@ async function runUnpacked(rendererDir, arg) {
     console.log('补丁备份       : ' + (st.bakExists ? '✅ 存在' : '— 不存在'));
     console.log('asar 校验开关  : — 无需处理（解包模式不动 asar，不触发校验）');
     process.exit(0);
+  }
+
+  // ---------- 安全闸门：5.8.3+ 解包文件带完整性校验，禁止直接修改 ----------
+  // 实测：asar header 里 renderer 全部 1907 个条目都带 integrity(SHA1)，
+  // 其中 1709 个是 unpacked 文件。直接改磁盘文件会让校验失败，
+  // 表现为「界面空白 + 一直刷新」，随后官方会把文件自动还原。
+  // 想真正改这个版本，必须同时：重打包 asar(更新 integrity) + 关 exe 的 fuse，
+  // 属于高风险操作，默认不放行。
+  if (!process.argv.includes('--unsafe')) {
+    console.log('');
+    console.log('✗ 已阻止修改：当前 WorkBuddy 对界面资源做了完整性校验。');
+    console.log('  这些文件（renderer 下 1907 个条目）在 app.asar 里都带 SHA1 校验值，');
+    console.log('  直接改磁盘文件会导致校验失败 → 界面空白、一直刷新，然后被官方自动还原。');
+    console.log('');
+    console.log('  这不是脚本坏了，是官方把这条路封了。');
+    console.log('  建议：用 WorkBuddy 自带的「外观 / 皮肤」设置（设置 → 个性化），安全且随版本保留。');
+    console.log('');
+    console.log('  仅供诊断：check（体检）/ restore（还原）不受影响，仍可正常使用。');
+    process.exit(1);
   }
 
   // ---------- 取字体名 ----------
