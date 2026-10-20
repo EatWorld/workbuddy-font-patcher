@@ -20,6 +20,14 @@
  *   - 改的是"界面 UI 字体"（正文、对话、侧边栏等）；代码/等宽字体不受影响。
  *   - WorkBuddy 升级更新后修改会被覆盖，重新跑一次即可。
  *
+ * v4.0 变更（适配 WorkBuddy 5.8.3+ 的解包结构）：
+ *   - 5.8.3 起官方把 renderer/ 整体解包到 resources/app.asar.unpacked/renderer/，
+ *     前端资源变成磁盘上的普通文件。脚本新增「解包模式」：直接改这些文件即可，
+ *     **不再重打包 asar、也不需要改动 exe 的 fuse 校验开关**（asar 本身没变，不触发校验）。
+ *   - 自动识别：检测到解包目录就走新流程，否则回落到旧的 asar 打包流程（兼容老版本）。
+ *   - 备份改为 resources/.wb-patch-backup/，还原时拷回即可。
+ *   - 注意：官方升级会覆盖这些文件，重跑一次即可恢复。
+ *
  * v3.3 变更（新增字体名校验，防止"改了没生效"）：
  *   - 打补丁前校验字体名是否真能被浏览器识别。TTF 常有两套家族名——
  *     nid=1(Family，GDI 用) 与 nid=16(TypographicFamily，Chromium 用)。
@@ -56,7 +64,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-const VERSION = '3.3';
+const VERSION = '4.0';
 
 // ==================== 1. 定位 WorkBuddy 的 app.asar ====================
 function findAppAsar() {
@@ -433,7 +441,7 @@ body[data-vscode-theme-name="IDE Light"] {
  * 硬编码文件名必然失效。
  */
 function isTokenCss(filePath, content) {
-  return /^renderer\/assets\/.*\.css$/.test(filePath) && /--wb-palette-brand-8\s*:/.test(content);
+  return /^(?:renderer\/)?assets\/.*\.css$/.test(filePath) && /--wb-palette-brand-8\s*:/.test(content);
 }
 
 // ==================== 5. 检测当前 asar 是否已被本工具打过补丁 ====================
@@ -463,6 +471,260 @@ function ask(question) {
   });
 }
 
+// ==================== 6b. 解包模式（WorkBuddy 5.8.3+）====================
+// 官方自 5.8.3 起把 renderer/ 整体解包到 resources/app.asar.unpacked/renderer/，
+// 前端资源变成磁盘上的普通文件。此时：
+//   - 直接改磁盘文件即可，不需要重打包 asar
+//   - 不需要动 exe 的 fuse 校验开关（asar 本身没变，不触发完整性校验）
+//   - 官方升级会覆盖这些文件，重跑一次即可恢复
+function findUnpackedRenderer(asarPath) {
+  const resDir = path.dirname(asarPath);
+  const cands = [
+    path.join(resDir, 'app.asar.unpacked', 'renderer'),
+    path.join(resDir, 'renderer'),
+  ];
+  for (const c of cands) if (fs.existsSync(path.join(c, 'index.html'))) return c;
+  return null;
+}
+
+function walkFiles(dir, filter, out) {
+  out = out || [];
+  let items = [];
+  try { items = fs.readdirSync(dir); } catch (e) { return out; }
+  for (const it of items) {
+    const p = path.join(dir, it);
+    let st; try { st = fs.statSync(p); } catch (e) { continue; }
+    if (st.isDirectory()) walkFiles(p, filter, out);
+    else if (!filter || filter(p)) out.push(p);
+  }
+  return out;
+}
+
+function unpackedPaths(rendererDir) {
+  const resDir = path.dirname(path.dirname(rendererDir));
+  const bakRoot = path.join(resDir, '.wb-patch-backup');
+  return { bakRoot, bakRenderer: path.join(bakRoot, 'renderer'), stateFile: path.join(bakRoot, 'state.json') };
+}
+
+function relOf(root, p) { return path.relative(root, p).replace(/\\/g, '/'); }
+
+function scanUnpacked(rendererDir) {
+  const { bakRenderer } = unpackedPaths(rendererDir);
+  const files = walkFiles(rendererDir, p => /\.(css|html)$/i.test(p));
+  const token = [], themed = [];
+  for (const f of files) {
+    const rel = relOf(rendererDir, f);
+    let s = ''; try { s = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    if (isTokenCss(rel, s)) token.push(rel);
+    if (s.includes(THEME_MARK)) themed.push(rel);
+  }
+  let idxMarked = false;
+  try { idxMarked = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8').includes(MARK); } catch (e) { }
+  return { files, token, themed, idxMarked, bakExists: fs.existsSync(bakRenderer) };
+}
+
+function applyUnpacked(rendererDir, F, doTheme, DRY) {
+  const { bakRoot, bakRenderer, stateFile } = unpackedPaths(rendererDir);
+  const patcher = F ? makePatcher(F) : null;
+  const files = walkFiles(rendererDir, p => /\.(css|html)$/i.test(p));
+  const plan = [];
+  const themeFiles = [];
+  let fontFiles = 0;
+
+  for (const f of files) {
+    const rel = relOf(rendererDir, f);
+    let cur; try { cur = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+    const bak = path.join(bakRenderer, rel);
+    // 基底：有备份就用备份（保证重复运行不叠加）
+    let base = cur;
+    if (fs.existsSync(bak)) { try { base = fs.readFileSync(bak, 'utf8'); } catch (e) { } }
+
+    let out = base;
+    if (patcher) {
+      const before = out;
+      out = patcher(out);
+      if (out !== before) fontFiles++;
+    }
+    if (doTheme && isTokenCss(rel, out)) {
+      const idx = out.indexOf('/* ' + THEME_MARK);
+      if (idx >= 0) out = out.slice(0, idx).replace(/\s+$/, '');
+      out = out + '\n' + CLAUDE_THEME_CSS;
+      themeFiles.push(rel);
+    }
+    if (rel === 'index.html' && !out.includes(MARK)) {
+      if (out.includes('</style>')) out = out.replace('</style>', '/* ' + MARK + ' */</style>');
+      else if (out.includes('</head>')) out = out.replace('</head>', '<!-- ' + MARK + ' --></head>');
+    }
+    if (out !== cur) plan.push({ f, rel, bak, out });
+  }
+
+  if (DRY) return { plan, fontFiles, themeFiles, total: files.length, written: 0 };
+
+  let written = 0;
+  for (const p of plan) {
+    try {
+      if (!fs.existsSync(p.bak)) {
+        fs.mkdirSync(path.dirname(p.bak), { recursive: true });
+        fs.copyFileSync(p.f, p.bak);   // 首次修改前备份官方原文件
+      }
+      fs.writeFileSync(p.f, p.out, 'utf8');
+      written++;
+    } catch (e) {
+      console.error('  ✗ 写入失败 ' + p.rel + ': ' + e.code + ' - ' + e.message);
+      if (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES') {
+        console.error('    请【完全退出 WorkBuddy】后重试（托盘图标右键 → 退出）。');
+      }
+    }
+  }
+
+  try {
+    fs.mkdirSync(bakRoot, { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({
+      mode: 'unpacked', patchedAt: new Date().toISOString(),
+      font: F ? F.trim() : '', theme: !!doTheme,
+      files: plan.map(p => p.rel),
+    }, null, 2), 'utf8');
+  } catch (e) { }
+
+  return { plan, fontFiles, themeFiles, total: files.length, written };
+}
+
+function restoreUnpacked(rendererDir) {
+  const { bakRoot, bakRenderer } = unpackedPaths(rendererDir);
+  if (!fs.existsSync(bakRenderer)) return { ok: false, restored: 0 };
+  const files = walkFiles(bakRenderer);
+  let restored = 0;
+  for (const b of files) {
+    const rel = relOf(bakRenderer, b);
+    const dst = path.join(rendererDir, rel);
+    try { fs.copyFileSync(b, dst); restored++; }
+    catch (e) { console.error('  ✗ 还原失败 ' + rel + ': ' + e.message); }
+  }
+  try { fs.rmSync(bakRoot, { recursive: true, force: true }); } catch (e) { }
+  return { ok: true, restored };
+}
+
+async function runUnpacked(rendererDir, arg) {
+  const DRY = arg === 'dry';
+  const AUTO = arg === 'auto' || arg === 'restore-config';
+  const cfg = loadConfig();
+  const st = scanUnpacked(rendererDir);
+
+  // ---------- 还原 ----------
+  if (arg === 'restore' || arg === 'restore-all') {
+    const FORCE = process.argv.includes('--force') || process.argv.includes('-y');
+    console.log('\n===== 还原（解包模式）=====');
+    if (!st.bakExists) {
+      console.log('· 没找到补丁备份，当前就是官方原版，无需还原。');
+      process.exit(0);
+    }
+    console.log('将把界面字体 / 配色恢复为官方默认。');
+    if (!FORCE) {
+      const ok = await ask('确定还原吗？(y/n)：');
+      if (!ok || !ok.toLowerCase().startsWith('y')) { console.log('已取消，未做任何修改。'); process.exit(0); }
+    }
+    const r = restoreUnpacked(rendererDir);
+    try { const c = loadConfig(); delete c.font; delete c.theme; saveConfig(c); } catch (e) { }
+    console.log('✓ 已还原 ' + r.restored + ' 个文件为官方原版');
+    console.log('  请重新打开 WorkBuddy。');
+    process.exit(0);
+  }
+
+  // ---------- 体检 ----------
+  if (arg === 'check') {
+    console.log('\n===== 体检结果（解包模式）=====');
+    console.log('资源目录       : ' + rendererDir);
+    console.log('css/html 文件  : ' + st.files.length);
+    console.log('token 主文件   : ' + (st.token.length ? st.token.join(', ') : '❌ 未找到（配色会失效）'));
+    console.log('字体补丁状态   : ' + (st.idxMarked ? '✅ 已打补丁' : '— 未打补丁（官方原版）'));
+    console.log('配色补丁状态   : ' + (st.themed.length ? '✅ 已打补丁 → ' + st.themed.join(', ') : '— 未打补丁（官方原版）'));
+    console.log('补丁备份       : ' + (st.bakExists ? '✅ 存在' : '— 不存在'));
+    console.log('asar 校验开关  : — 无需处理（解包模式不动 asar，不触发校验）');
+    process.exit(0);
+  }
+
+  // ---------- 取字体名 ----------
+  let fontInput = DRY ? (process.argv[3] || '') : arg;
+  if (AUTO) {
+    fontInput = cfg.font || '';
+    console.log('[自动模式] 字体: ' + (fontInput || '不改'));
+    if (!fontInput && !cfg.theme) {
+      console.error('\n✗ 没有记住任何设置。请先运行一次「改字体」设置。');
+      process.exit(1);
+    }
+  }
+  if (!fontInput) {
+    const hint = cfg.font ? '（直接回车 = 用上次的「' + cfg.font + '」）' : '（直接回车 = 不改字体）';
+    fontInput = await ask('[1/2] 字体名' + hint + '：');
+    if (!fontInput.trim() && cfg.font) fontInput = cfg.font;
+  }
+  let F = null;
+  if (fontInput && fontInput.trim()) {
+    try { F = parseFontName(fontInput); }
+    catch (e) { console.error('✗ ' + e.message); process.exit(1); }
+  }
+
+  // ---------- 字体名校验 ----------
+  if (fontInput && fontInput.trim()) {
+    const names = fontInput.split(/[,，;；]/).map(s => s.trim()).filter(Boolean);
+    for (const nm of names) {
+      const v = verifyFontName(nm);
+      if (v.ok) continue;
+      console.log('');
+      console.log(v.known
+        ? '⚠ 字体名校验：「' + nm + '」在系统里存在，但类型不对。'
+        : '⚠ 字体名校验：系统里没找到「' + nm + '」。');
+      console.log('  ' + v.warn);
+      if (v.suggestion) console.log('  → 建议改用：' + v.suggestion);
+      console.log('  CSS 里名字对不上不会报错，只会静默回退默认字体。');
+      if (!process.argv.includes('--force') && !process.argv.includes('-y') && !AUTO) {
+        const go = await ask('  仍要继续吗？(y = 继续 / 直接回车 = 取消)：');
+        if (!go || !go.toLowerCase().startsWith('y')) { console.log('  已取消，未做任何修改。'); process.exit(0); }
+      }
+    }
+  }
+
+  // ---------- 取配色选择 ----------
+  let doTheme;
+  if (AUTO) {
+    doTheme = cfg.theme !== false;
+    console.log('[自动模式] 配色: ' + (doTheme ? 'Claude 暖色' : '不改'));
+  } else {
+    const tHint = cfg.theme === false ? '，直接回车 = 不改' : '，直接回车 = 改';
+    const ans = await ask('[2/2] 改成 Claude 暖色配色？(y/n' + tHint + ')：');
+    if (ans && ans.trim()) doTheme = !ans.toLowerCase().startsWith('n');
+    else doTheme = cfg.theme !== false;
+  }
+
+  console.log('----------------------------------------');
+  console.log(F ? ('字体: ' + F.trim()) : '字体: 不改');
+  console.log(doTheme ? '配色: 改为 Claude 暖色' : '配色: 不改');
+  if (!F && !doTheme) { console.log('未选择任何改动，退出。'); process.exit(0); }
+
+  // ---------- 执行 ----------
+  const r = applyUnpacked(rendererDir, F, doTheme, DRY);
+  console.log('共 ' + r.total + ' 个 css/html 文件');
+  if (F) console.log('字体已修改: ' + r.fontFiles + ' 个文件');
+  if (doTheme) console.log('配色挂载点: ' + (r.themeFiles.length ? r.themeFiles.join(', ') : '❌ 未找到'));
+
+  if (DRY) {
+    console.log('\n[dry-run] 计划修改 ' + r.plan.length + ' 个文件，未写入：');
+    r.plan.slice(0, 20).forEach(p => console.log('    ' + p.rel));
+    if (r.plan.length > 20) console.log('    ... 共 ' + r.plan.length + ' 个');
+    return;
+  }
+
+  if (r.written === 0) {
+    console.log('\n· 没有文件需要改动（可能已经是当前状态）。');
+    process.exit(0);
+  }
+
+  saveConfig({ font: F ? fontInput.trim() : '', theme: doTheme, savedAt: new Date().toISOString() });
+  console.log('\n✓ 完成！已写入 ' + r.written + ' 个文件，请重新打开 WorkBuddy。');
+  console.log('  备份在 ' + unpackedPaths(rendererDir).bakRoot);
+  console.log('  还原：运行 restore 或工具箱选 [4]');
+}
+
 // ==================== 7. 主流程 ====================
 (async function main() {
   const arg = process.argv[2] || '';
@@ -480,6 +742,15 @@ function ask(question) {
   console.log('程序文件:', target);
 
   const backup = target + '.backup';
+
+  // ---------- 分流：5.8.3+ 解包模式优先 ----------
+  const unpackedRenderer = findUnpackedRenderer(target);
+  if (unpackedRenderer) {
+    console.log('资源模式      : 解包（新版结构，直接改磁盘文件，不动 asar / exe）');
+    console.log('资源目录      :', unpackedRenderer);
+    await runUnpacked(unpackedRenderer, arg);
+    return;
+  }
 
   // ---------- restore：总还原（asar + exe + 校验开关，全部回到官方原样）----------
   if (arg === 'restore' || arg === 'restore-all') {
